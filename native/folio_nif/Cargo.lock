@@ -2273,6 +2273,7 @@ checksum = "6af6ae20167a9ece4bcb41af5b80f8a1f1df981f6391189ce00fd257af04126a"
 [[package]]
 name = "typst"
 version = "0.14.2"
+source = "git+https://github.com/dannote/typst?rev=452eba4e4#452eba4e49a66709a68a4ac6f695a1420238d396"
 dependencies = [
  "arrayvec",
  "comemo",
@@ -2297,6 +2298,7 @@ source = "git+https://github.com/typst/typst-assets?rev=57a38ca#57a38ca98236748a
 [[package]]
 name = "typst-eval"
 version = "0.14.2"
+source = "git+https://github.com/dannote/typst?rev=452eba4e4#452eba4e49a66709a68a4ac6f695a1420238d396"
 dependencies = [
  "comemo",
  "ecow",
@@ -2315,6 +2317,7 @@ dependencies = [
 [[package]]
 name = "typst-html"
 version = "0.14.2"
+source = "git+https://github.com/dannote/typst?rev=452eba4e4#452eba4e49a66709a68a4ac6f695a1420238d396"
 dependencies = [
  "bumpalo",
  "comemo",
@@ -2334,6 +2337,7 @@ dependencies = [
 [[package]]
 name = "typst-layout"
 version = "0.14.2"
+source = "git+https://github.com/dannote/typst?rev=452eba4e4#452eba4e49a66709a68a4ac6f695a1420238d396"
 dependencies = [
  "az",
  "bumpalo",
@@ -2369,6 +2373,7 @@ dependencies = [
 [[package]]
 name = "typst-library"
 version = "0.14.2"
+source = "git+https://github.com/dannote/typst?rev=452eba4e4#452eba4e49a66709a68a4ac6f695a1420238d396"
 dependencies = [
  "arrayvec",
  "az",
@@ -2435,6 +2440,7 @@ dependencies = [
 [[package]]
 name = "typst-macros"
 version = "0.14.2"
+source = "git+https://github.com/dannote/typst?rev=452eba4e4#452eba4e49a66709a68a4ac6f695a1420238d396"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -2445,6 +2451,7 @@ dependencies = [
 [[package]]
 name = "typst-pdf"
 version = "0.14.2"
+source = "git+https://github.com/dannote/typst?rev=452eba4e4#452eba4e49a66709a68a4ac6f695a1420238d396"
 dependencies = [
  "az",
  "bytemuck",
@@ -2471,6 +2478,7 @@ dependencies = [
 [[package]]
 name = "typst-realize"
 version = "0.14.2"
+source = "git+https://github.com/dannote/typst?rev=452eba4e4#452eba4e49a66709a68a4ac6f695a1420238d396"
 dependencies = [
  "arrayvec",
  "bumpalo",
@@ -2487,6 +2495,7 @@ dependencies = [
 [[package]]
 name = "typst-render"
 version = "0.14.2"
+source = "git+https://github.com/dannote/typst?rev=452eba4e4#452eba4e49a66709a68a4ac6f695a1420238d396"
 dependencies = [
  "bytemuck",
  "comemo",
@@ -2507,6 +2516,7 @@ dependencies = [
 [[package]]
 name = "typst-svg"
 version = "0.14.2"
+source = "git+https://github.com/dannote/typst?rev=452eba4e4#452eba4e49a66709a68a4ac6f695a1420238d396"
 dependencies = [
  "base64",
  "comemo",
@@ -2532,6 +2542,7 @@ dependencies = [
 [[package]]
 name = "typst-syntax"
 version = "0.14.2"
+source = "git+https://github.com/dannote/typst?rev=452eba4e4#452eba4e49a66709a68a4ac6f695a1420238d396"
 dependencies = [
  "ecow",
  "rustc-hash",
@@ -2549,6 +2560,7 @@ dependencies = [
 [[package]]
 name = "typst-timing"
 version = "0.14.2"
+source = "git+https://github.com/dannote/typst?rev=452eba4e4#452eba4e49a66709a68a4ac6f695a1420238d396"
 dependencies = [
  "parking_lot",
  "serde",
@@ -2558,6 +2570,7 @@ dependencies = [
 [[package]]
 name = "typst-utils"
 version = "0.14.2"
+source = "git+https://github.com/dannote/typst?rev=452eba4e4#452eba4e49a66709a68a4ac6f695a1420238d396"
 dependencies = [
  "libm",
  "once_cell",

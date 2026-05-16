@@ -55,10 +55,8 @@ defmodule Folio.MixProject do
       licenses: ["MIT"],
       links: %{"GitHub" => @source_url},
       files: ~w(lib native/folio_nif/Cargo.toml native/folio_nif/Cargo.lock native/folio_nif/src
-           vendor/typst/Cargo.toml vendor/typst/Cargo.lock vendor/typst/crates
            mix.exs README.md LICENSE.md CHANGELOG.md .rustler.toml
-           checksum-Elixir.Folio.Native.exs),
-      exclude_patterns: [~r{vendor/typst/crates/typst-cli}, ~r{vendor/typst/crates/typst-ide}]
+           checksum-Elixir.Folio.Native.exs)
     ]
   end
 
