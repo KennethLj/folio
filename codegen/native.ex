@@ -14,7 +14,7 @@ defmodule Folio.Codegen.Native do
         styles: "Vec<ExStyle>",
         files: "std::collections::HashMap<String, rustler::Binary<'a>>"
       ],
-      returns: "NifResult<rustler::Binary<'a>>",
+      returns: "NifResult<(rustler::Binary<'a>, Vec<String>)>",
       lifetime: :a,
       schedule: :dirty_cpu
     ],
@@ -24,7 +24,7 @@ defmodule Folio.Codegen.Native do
         styles: "Vec<ExStyle>",
         files: "std::collections::HashMap<String, rustler::Binary<'a>>"
       ],
-      returns: "NifResult<Vec<String>>",
+      returns: "NifResult<(Vec<String>, Vec<String>)>",
       lifetime: :a,
       schedule: :dirty_cpu
     ],
@@ -36,7 +36,7 @@ defmodule Folio.Codegen.Native do
         files: "std::collections::HashMap<String, rustler::Binary<'a>>",
         dpi: :f64
       ],
-      returns: "NifResult<Vec<rustler::Binary<'a>>>",
+      returns: "NifResult<(Vec<rustler::Binary<'a>>, Vec<String>)>",
       lifetime: :a,
       schedule: :dirty_cpu
     ],

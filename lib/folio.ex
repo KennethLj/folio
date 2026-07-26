@@ -33,7 +33,16 @@ defmodule Folio do
 
   For one-off files, use `register_file/2`. For session-scoped isolation,
   use `Folio.Document.attach_file/3` — files live only within that document.
+
+  ## Warnings
+
+  Typst raises warnings that don't stop a compile — most notably when
+  introspection-driven content (page counters, refs, outlines) fails to settle
+  within five layout passes. These are emitted through `Logger` at `:warning`
+  level; the compile still returns `{:ok, result}`.
   """
+
+  require Logger
 
   @doc "Imports `Folio.DSL` and `Folio.Sigil`."
   defmacro __using__(_opts) do
@@ -194,10 +203,13 @@ defmodule Folio do
     {:ok, {content, Keyword.get(opts, :styles, []), %{}}}
   end
 
-  @spec wrap_call((-> result), (String.t() -> exception)) :: {:ok, result} | {:error, exception}
+  @spec wrap_call((-> {result, [String.t()]}), (String.t() -> exception)) ::
+          {:ok, result} | {:error, exception}
         when result: var, exception: Exception.t()
   defp wrap_call(fun, error_builder) do
-    {:ok, fun.()}
+    {result, warnings} = fun.()
+    Enum.each(warnings, &Logger.warning("Folio: " <> &1))
+    {:ok, result}
   rescue
     e in ErlangError ->
       reason = format_nif_error(Exception.message(e))

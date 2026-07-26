@@ -30,15 +30,20 @@ defmodule Folio.Native do
   @spec parse_markdown(String.t()) :: [Content.t()]
   def parse_markdown(_markdown), do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec compile_pdf([Content.t()], [Styles.rule()], %{String.t() => binary()}) :: binary()
+  # The compile NIFs return `{payload, warnings}`; `Folio` logs the warnings and
+  # hands the caller just the payload.
+  @type warnings :: [String.t()]
+
+  @spec compile_pdf([Content.t()], [Styles.rule()], %{String.t() => binary()}) ::
+          {binary(), warnings()}
   def compile_pdf(_content, _styles, _files), do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec compile_svg([Content.t()], [Styles.rule()], %{String.t() => binary()}) :: [String.t()]
+  @spec compile_svg([Content.t()], [Styles.rule()], %{String.t() => binary()}) ::
+          {[String.t()], warnings()}
   def compile_svg(_content, _styles, _files), do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec compile_png([Content.t()], [Styles.rule()], %{String.t() => binary()}, float()) :: [
-          binary()
-        ]
+  @spec compile_png([Content.t()], [Styles.rule()], %{String.t() => binary()}, float()) ::
+          {[binary()], warnings()}
   def compile_png(_content, _styles, _files, _dpi), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec register_file(String.t(), binary()) :: :ok

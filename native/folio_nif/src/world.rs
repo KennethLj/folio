@@ -4,13 +4,13 @@ use std::str::FromStr;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use typst::comemo::{Constraint, Track, TrackedMut};
-use typst::diag::{FileError, FileResult};
+use typst::diag::{FileError, FileResult, SourceDiagnostic};
 use typst::engine::{Engine, Route, Sink, Traced};
 use typst::foundations::{
     Bytes, Content, Context, Datetime, Derived, Duration, NativeElement, Output, Smart,
     StyleChain, Styles, Target, TargetElem,
 };
-use typst::introspection::{EmptyIntrospector, Introspector, MAX_ITERS};
+use typst::introspection::{analyze, EmptyIntrospector, Introspector, MAX_ITERS};
 use typst::layout::{Abs, Margin, Sides};
 use typst::layout::PageElem;
 use typst::loading::{DataSource, LoadSource, Loaded};
@@ -119,45 +119,57 @@ impl FolioWorld {
         Self { styles }
     }
 
-    pub fn compile_to_pdf(&self, content: &[ExContent]) -> Result<Vec<u8>, String> {
-        let doc = self.layout(content)?;
-        pdf(&doc, &PdfOptions {
+    pub fn compile_to_pdf(&self, content: &[ExContent]) -> Result<(Vec<u8>, Vec<String>), String> {
+        let (doc, warnings) = self.layout(content)?;
+        let bytes = pdf(&doc, &PdfOptions {
             ident: Smart::Auto,
             timestamp: None,
             page_ranges: None,
             standards: Default::default(),
             tagged: false,
         })
-        .map_err(|e| format!("PDF export error: {:?}", e))
+        .map_err(|e| format!("PDF export error: {:?}", e))?;
+        Ok((bytes, warnings))
     }
 
-    pub fn compile_to_svg(&self, content: &[ExContent]) -> Result<Vec<String>, String> {
-        let doc = self.layout(content)?;
-        Ok(doc.pages().iter().map(svg).collect())
+    pub fn compile_to_svg(&self, content: &[ExContent]) -> Result<(Vec<String>, Vec<String>), String> {
+        let (doc, warnings) = self.layout(content)?;
+        Ok((doc.pages().iter().map(svg).collect(), warnings))
     }
 
     /// Render each page to PNG at the given DPI scale.
     /// Peak memory is proportional to the largest page, not the total document.
-    pub fn compile_to_png(&self, content: &[ExContent], dpi: f64) -> Result<Vec<Vec<u8>>, String> {
+    pub fn compile_to_png(&self, content: &[ExContent], dpi: f64) -> Result<(Vec<Vec<u8>>, Vec<String>), String> {
         let scale = if dpi <= 0.0 { 2.0 } else { dpi };
-        let doc = self.layout(content)?;
-        doc.pages().iter().map(|p| {
+        let (doc, warnings) = self.layout(content)?;
+        let pages: Vec<Vec<u8>> = doc.pages().iter().map(|p| {
             render(p, scale as f32).encode_png().map_err(|e| format!("PNG encode error: {:?}", e))
-        }).collect()
+        }).collect::<Result<_, _>>()?;
+        Ok((pages, warnings))
     }
 
-    fn layout(&self, content: &[ExContent]) -> Result<typst_layout::PagedDocument, String> {
+    /// Lay out the document, returning it alongside any diagnostics Typst
+    /// raised along the way.
+    ///
+    /// Mirrors `compile_impl` in `typst/src/lib.rs`: build the body once, then
+    /// relayout until introspection stabilizes. Each attempt gets its own sink
+    /// so that diagnostics from discarded iterations don't leak into the
+    /// result — only the sink of the iteration we actually keep is merged.
+    fn layout(
+        &self,
+        content: &[ExContent],
+    ) -> Result<(typst_layout::PagedDocument, Vec<String>), String> {
         let traced = Traced::default();
         let empty = EmptyIntrospector;
+        let mut sink = Sink::new();
 
-        let mut build_sink = Sink::new();
         let (body, user_styles) = {
             let mut engine = Engine {
                 routines: &typst::ROUTINES,
                 world: Track::track(self),
                 introspector: typst::utils::Protected::new(empty.track()),
                 traced: traced.track(),
-                sink: build_sink.track_mut(),
+                sink: sink.track_mut(),
                 route: Route::root(),
             };
             let body = build_content(&mut engine, content);
@@ -172,32 +184,68 @@ impl FolioWorld {
         let chained = base.chain(&target_style);
         let styles = chained.chain(&user_styles);
 
-        let mut prev: Option<typst_layout::PagedDocument> = None;
-        for _ in 0..MAX_ITERS {
+        // At most MAX_ITERS - 1 documents are retained; the final attempt is
+        // kept in `doc`. `analyze` needs the whole history to say *which*
+        // introspection failed to settle.
+        let mut history: Vec<typst_layout::PagedDocument> = Vec::new();
+        let doc = loop {
             let constraint = Constraint::new();
-            let introspector: &dyn Introspector = match &prev {
-                Some(doc) => Output::introspector(doc),
-                None => &empty,
-            };
-            let mut iter_sink = Sink::new();
+            let mut subsink = Sink::new();
             let doc = {
+                let introspector: &dyn Introspector = match history.last() {
+                    Some(doc) => Output::introspector(doc),
+                    None => &empty,
+                };
                 let mut engine = Engine {
                     routines: &typst::ROUTINES,
                     world: Track::track(self),
                     introspector: typst::utils::Protected::new(introspector.track_with(&constraint)),
                     traced: traced.track(),
-                    sink: iter_sink.track_mut(),
+                    sink: subsink.track_mut(),
                     route: Route::root(),
                 };
                 layout_document(&mut engine, &body, styles)
                     .map_err(|e| format!("Layout error: {:?}", e))?
             };
+
             if constraint.validate(Output::introspector(&doc)) {
-                return Ok(doc);
+                sink.extend_from_sink(subsink);
+                break doc;
             }
-            prev = Some(doc);
+
+            if history.len() == MAX_ITERS - 1 {
+                let mut introspectors = [&empty as &dyn Introspector; MAX_ITERS + 1];
+                for (i, prev) in history.iter().enumerate() {
+                    introspectors[i + 1] = Output::introspector(prev);
+                }
+                introspectors[MAX_ITERS] = Output::introspector(&doc);
+
+                let warnings = analyze(
+                    Track::track(self),
+                    &typst::ROUTINES,
+                    introspectors,
+                    subsink.introspections(),
+                );
+
+                sink.extend_from_sink(subsink);
+                for warning in warnings {
+                    sink.warn(warning);
+                }
+                break doc;
+            }
+
+            history.push(doc);
+        };
+
+        // Typst defers some errors so that layout can finish; promote them now,
+        // otherwise they would vanish along with the sink.
+        let delayed = sink.delayed();
+        if !delayed.is_empty() {
+            let messages: Vec<String> = delayed.iter().map(format_diagnostic).collect();
+            return Err(format!("Layout error: {}", messages.join("; ")));
         }
-        prev.ok_or_else(|| "Layout error: introspection did not converge".to_string())
+
+        Ok((doc, sink.warnings().iter().map(format_diagnostic).collect()))
     }
 
     pub fn eval_math(engine: &mut Engine, math_str: &str, block: bool) -> Content {
@@ -221,6 +269,19 @@ impl FolioWorld {
             Err(_) => TextElem::packed(eco_format!("${}$", math_str)),
         }
     }
+}
+
+/// Render a diagnostic as a flat string.
+///
+/// Spans are dropped deliberately: folio never builds content from Typst
+/// source, so every span is detached and would only ever point at nothing.
+fn format_diagnostic(diag: &SourceDiagnostic) -> String {
+    let mut out = diag.message.to_string();
+    for hint in &diag.hints {
+        out.push_str("\n  hint: ");
+        out.push_str(&hint.v);
+    }
+    out
 }
 
 pub(crate) fn get_image_source(src: &str) -> Option<Derived<DataSource, Loaded>> {

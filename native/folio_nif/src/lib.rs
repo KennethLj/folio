@@ -67,7 +67,7 @@ fn compile_pdf_impl<'a>(
     content: Vec<ExContent>,
     styles: Vec<ExStyle>,
     files: std::collections::HashMap<String, rustler::Binary<'a>>,
-) -> NifResult<rustler::Binary<'a>> {
+) -> NifResult<(rustler::Binary<'a>, Vec<String>)> {
     catch_nif("compile_pdf", || {
         let session_files = decode_file_map(files);
         let world = FolioWorld::new(styles, session_files);
@@ -75,8 +75,8 @@ fn compile_pdf_impl<'a>(
             .compile_to_pdf(&content)
             .map_err(|msg| rustler::Error::RaiseTerm(Box::new(msg)));
         world_mod::clear_session_files();
-        let bytes = result?;
-        alloc_binary(env, &bytes)
+        let (bytes, warnings) = result?;
+        Ok((alloc_binary(env, &bytes)?, warnings))
     })
 }
 
@@ -84,7 +84,7 @@ fn compile_svg_impl<'a>(
     content: Vec<ExContent>,
     styles: Vec<ExStyle>,
     files: std::collections::HashMap<String, rustler::Binary<'a>>,
-) -> NifResult<Vec<String>> {
+) -> NifResult<(Vec<String>, Vec<String>)> {
     catch_nif("compile_svg", || {
         let session_files = decode_file_map(files);
         let world = FolioWorld::new(styles, session_files);
@@ -105,7 +105,7 @@ fn compile_png_impl<'a>(
     styles: Vec<ExStyle>,
     files: std::collections::HashMap<String, rustler::Binary<'a>>,
     dpi: f64,
-) -> NifResult<Vec<rustler::Binary<'a>>> {
+) -> NifResult<(Vec<rustler::Binary<'a>>, Vec<String>)> {
     catch_nif("compile_png", || {
         let session_files = decode_file_map(files);
         let world = FolioWorld::new(styles, session_files);
@@ -113,8 +113,10 @@ fn compile_png_impl<'a>(
             .compile_to_png(&content, dpi)
             .map_err(|msg| rustler::Error::RaiseTerm(Box::new(msg)));
         world_mod::clear_session_files();
-        let pages = result?;
-        pages.iter().map(|b| alloc_binary(env, b)).collect()
+        let (pages, warnings) = result?;
+        let binaries: Vec<rustler::Binary<'a>> =
+            pages.iter().map(|b| alloc_binary(env, b)).collect::<NifResult<_>>()?;
+        Ok((binaries, warnings))
     })
 }
 

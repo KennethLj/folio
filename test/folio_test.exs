@@ -207,6 +207,26 @@ defmodule FolioTest do
     end
   end
 
+  describe "diagnostics" do
+    import ExUnit.CaptureLog
+
+    test "a ref with no matching label fails the compile" do
+      # Typst records this as a delayed error so that layout can finish. Before
+      # the sink was drained it vanished and the ref rendered as nothing.
+      assert {:error, %Folio.CompileError{reason: reason}} =
+               Folio.to_svg([Folio.DSL.text("see "), Folio.DSL.ref("nope")])
+
+      assert reason =~ "does not exist in the document"
+      assert reason =~ "nope"
+    end
+
+    test "a clean compile logs nothing" do
+      log = capture_log(fn -> assert {:ok, _} = Folio.to_pdf("# Hello\n\nWorld") end)
+
+      refute log =~ "Folio:"
+    end
+  end
+
   describe "to_png/2" do
     test "generates PNG binaries" do
       assert {:ok, [png | _]} = Folio.to_png("PNG test")

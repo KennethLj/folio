@@ -10,7 +10,7 @@ fn compile_pdf<'a>(
     content: Vec<ExContent>,
     styles: Vec<ExStyle>,
     files: std::collections::HashMap<String, rustler::Binary<'a>>,
-) -> NifResult<rustler::Binary<'a>> {
+) -> NifResult<(rustler::Binary<'a>, Vec<String>)> {
     compile_pdf_impl(env, content, styles, files)
 }
 #[rustler::nif(schedule = "DirtyCpu")]
@@ -18,7 +18,7 @@ fn compile_svg<'a>(
     content: Vec<ExContent>,
     styles: Vec<ExStyle>,
     files: std::collections::HashMap<String, rustler::Binary<'a>>,
-) -> NifResult<Vec<String>> {
+) -> NifResult<(Vec<String>, Vec<String>)> {
     compile_svg_impl(content, styles, files)
 }
 #[rustler::nif(schedule = "DirtyCpu")]
@@ -28,7 +28,7 @@ fn compile_png<'a>(
     styles: Vec<ExStyle>,
     files: std::collections::HashMap<String, rustler::Binary<'a>>,
     dpi: f64,
-) -> NifResult<Vec<rustler::Binary<'a>>> {
+) -> NifResult<(Vec<rustler::Binary<'a>>, Vec<String>)> {
     compile_png_impl(env, content, styles, files, dpi)
 }
 #[rustler::nif]
