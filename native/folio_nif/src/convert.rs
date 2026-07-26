@@ -223,8 +223,14 @@ pub fn build_content(engine: &mut Engine, nodes: &[ExContent]) -> Content {
         // Only insert auto parbreaks between paragraph-like content and other blocks,
         // or between two paragraph-like blocks. Don't insert between arbitrary
         // block elements (grid, align, vspace, etc.) to match Typst source behavior.
-        if i > 0 {
-            let prev = &nodes[i - 1];
+        // A label attaches to the element before it and contributes no content of
+        // its own, so it must not interrupt the lookback — otherwise a label
+        // between two paragraphs would swallow the parbreak that separates them.
+        let prev = nodes[..i]
+            .iter()
+            .rev()
+            .find(|n| !matches!(n, ExContent::Label(_)));
+        if let Some(prev) = prev {
             let needs_parbreak = match (prev, node) {
                 // Never insert around explicit spacing/pagebreaks
                 (ExContent::VSpace(_), _) | (_, ExContent::VSpace(_)) => false,

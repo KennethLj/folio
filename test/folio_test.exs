@@ -136,19 +136,74 @@ defmodule FolioTest do
       assert is_binary(svg)
       assert String.starts_with?(svg, "<svg")
     end
+  end
+
+  # Layout runs in a convergence loop so that anything resolved during Typst's
+  # second pass — page counters, refs, outline entries — actually sees the laid
+  # out document instead of an empty introspector.
+  describe "introspection" do
+    import Folio.DSL
+
+    # Number of glyphs the renderer emitted, as a proxy for "was anything
+    # actually laid out here" without needing to decode the SVG symbol table.
+    defp glyph_count(svg), do: svg |> String.split("<use ") |> length() |> Kernel.-(1)
 
     test "page_numbering advances the counter across pages" do
-      import Folio.DSL
-
       assert {:ok, [page1, page2 | _] = pages} =
                Folio.to_svg(
                  [text("body"), pagebreak(), text("body")],
                  styles: [Folio.Styles.page_numbering("1")]
                )
 
-      assert length(pages) >= 2
-      # Body content should be the same, but page numbering should differ
+      assert length(pages) == 2
+
+      # Identical bodies, so the only thing that can differ is the page number.
+      # Both pages carry one glyph beyond the four of "body".
+      assert glyph_count(page1) == 5
+      assert glyph_count(page2) == 5
       assert page1 != page2
+    end
+
+    test "outline collects headings from later pages" do
+      assert {:ok, [outline_page | _]} =
+               Folio.to_svg(
+                 [outline(), pagebreak(), heading(1, "Chapter One"), text("x")],
+                 styles: [Folio.Styles.heading_numbering("1.")]
+               )
+
+      # The "Contents" title alone is 8 glyphs; entries add the heading text,
+      # its number, the dot leaders and the page number.
+      assert glyph_count(outline_page) > 20
+    end
+
+    test "ref resolves against a label attached to a preceding heading" do
+      content = [heading(1, "Target"), label("tgt"), parbreak(), text("see "), ref("tgt")]
+      styles = [Folio.Styles.heading_numbering("1.")]
+
+      assert {:ok, [page]} = Folio.to_svg(content, styles: styles)
+
+      # "1. Target" (8) + "see " (3) is 11; a resolved ref renders "Section 1"
+      # on top of that rather than collapsing to nothing.
+      assert glyph_count(page) > 11
+    end
+
+    test "a label does not disturb the layout of the content around it" do
+      [p1, p2] = Folio.parse_markdown!("AAA\n\nBBB")
+
+      assert {:ok, [without]} = Folio.to_svg([p1, p2])
+      assert {:ok, [with_label]} = Folio.to_svg([p1, label("x"), p2])
+
+      # The label attaches to the preceding paragraph and emits nothing itself,
+      # so both paragraphs must still be separated by the same parbreak.
+      assert baselines(without) == baselines(with_label)
+      assert length(baselines(without)) == 2
+    end
+
+    defp baselines(svg) do
+      ~r/matrix\(1 0 0 -1 [\d.]+ ([\d.]+)\)/
+      |> Regex.scan(svg)
+      |> Enum.map(&List.last/1)
+      |> Enum.uniq()
     end
   end
 

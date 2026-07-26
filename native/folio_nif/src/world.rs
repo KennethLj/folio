@@ -180,17 +180,18 @@ impl FolioWorld {
                 None => &empty,
             };
             let mut iter_sink = Sink::new();
-            let mut engine = Engine {
-                routines: &typst::ROUTINES,
-                world: Track::track(self),
-                introspector: typst::utils::Protected::new(introspector.track_with(&constraint)),
-                traced: traced.track(),
-                sink: iter_sink.track_mut(),
-                route: Route::root(),
+            let doc = {
+                let mut engine = Engine {
+                    routines: &typst::ROUTINES,
+                    world: Track::track(self),
+                    introspector: typst::utils::Protected::new(introspector.track_with(&constraint)),
+                    traced: traced.track(),
+                    sink: iter_sink.track_mut(),
+                    route: Route::root(),
+                };
+                layout_document(&mut engine, &body, styles)
+                    .map_err(|e| format!("Layout error: {:?}", e))?
             };
-            let doc = layout_document(&mut engine, &body, styles)
-                .map_err(|e| format!("Layout error: {:?}", e))?;
-            drop(engine);
             if constraint.validate(Output::introspector(&doc)) {
                 return Ok(doc);
             }
