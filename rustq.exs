@@ -1,7 +1,7 @@
 use RustQ.Config
 
-require_file("lib/folio/codegen/content_nodes.ex")
-require_file("lib/folio/codegen/native.ex")
+require_file("codegen/content_nodes.ex")
+require_file("codegen/native.ex")
 
 generate :nifs, "native/folio_nif/src/generated_nifs.rs" do
   build(&Folio.Codegen.Native.rust_nifs/0)

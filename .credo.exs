@@ -1,7 +1,8 @@
 %{
   configs: [
     %{
-      name: "default"
+      name: "default",
+      files: %{included: ["codegen/", "lib/", "test/"]}
     }
   ]
 }
