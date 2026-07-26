@@ -4,124 +4,114 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Folio is an Elixir library that produces print-quality PDF / SVG / PNG from Markdown + an Elixir DSL, by driving [Typst](https://typst.app)'s layout engine through a Rustler NIF.
+Folio is a **thin adaptor** over Typst's compiler, exposed to Elixir through a Rustler NIF.
+It hands Typst source and a file map to `typst::compile` and returns PDF bytes.
 
-The **primary path bypasses the Typst parser and evaluator** — content trees are constructed directly in Rust from Elixir structs and fed to the layout stage, so the normal pipeline carries no Typst source string. That's what buys the typed DSL: bad input raises `ArgumentError` in Elixir before anything reaches Rust.
+The load-bearing property is that **nothing Typst does is reimplemented here**. There is no
+content-tree builder, no style translation layer, no markdown bridge, no show-rule engine.
+Templates get the real evaluator: `#set`/`#show`, `context`, outlines, `@refs`, counters,
+user-defined functions. The layout convergence loop, introspection settling and diagnostic
+promotion are Typst's own `compile_impl`, not a copy of it.
 
-The evaluator is still linked and reachable through two deliberate escape hatches:
-
-- `raw_typst/1` → `typst_eval::eval_string` in `SyntaxMode::Markup` (`convert.rs`). This is the *full* evaluator — set rules, show rules, `context` / `here()`, `for` loops, `let` bindings and user-defined functions all work.
-- `FolioWorld::eval_math` → `eval_string` in `SyntaxMode::Math` (`world.rs`), used for `$...$` from markdown and `math/2`.
-
-Treat that distinction as load-bearing when changing the architecture: adding a node type belongs on the struct path, not the eval path. And `raw_typst/1` runs arbitrary Typst, so it is **not safe for untrusted input** — Typst caps a single loop at 10,000 iterations (`typst-eval/src/flow.rs`), but nested loops multiply and NIFs run on DirtyCpu schedulers. File access is confined to the session/global file store.
+If you are tempted to add a node type, a style struct, or an Elixir-side transform — don't.
+That is the architecture this replaced, and every bug it had was a bug in the copy rather
+than in Typst. Add it to the `.typ` template instead.
 
 ## Common commands
 
 ```sh
 mix deps.get
-mix test                          # run tests
-mix test test/dsl_test.exs        # single file
-mix test test/dsl_test.exs:42     # single test by line
+mix test
+mix test test/folio_test.exs:42     # single test by line
 mix format
 mix credo --strict
-mix dialyzer
-mix ci                            # the full CI bundle: compile --warnings-as-errors, format --check-formatted, credo --strict, dialyzer, test, ex_dna
+mix ci                              # compile --warnings-as-errors, format, credo, dialyzer, test, ex_dna
 ```
 
 ### NIF build
 
-Precompiled NIFs are downloaded for supported targets (macOS x86_64/aarch64, Linux glibc x86_64/aarch64) — no Rust toolchain needed for users.
+Precompiled NIFs are downloaded for macOS x86_64/aarch64 and Linux glibc x86_64/aarch64.
+`lib/folio/native.ex` forces a source build when it detects `test/test_helper.exs` + `.git`
+(i.e. when working in this repo). Elsewhere: `FOLIO_BUILD=1 mix compile`.
 
-When working **in this repo** on dev/test, `lib/folio/native.ex` automatically forces a source build (it detects `test/test_helper.exs` + `.git`). To force a source build elsewhere: `FOLIO_BUILD=1 mix compile`.
-
-`native/folio_nif/Cargo.toml` pulls the typst crates from `github.com/dannote/typst` (a fork = upstream typst + 6 lines making `Bibliography::load` and `FirstLineIndent::new` public for embedder use). All eight crates must come from the same source — splitting some from upstream and some from the fork yields incompatible `typst-utils` copies in the dep graph. Once those `pub` bumps land upstream, swap all eight back to `github.com/typst/typst` and bump the rev together.
-
-Releases (precompiled NIF artifacts + `checksum-Elixir.Folio.Native.exs`) are produced by `.github/workflows/release.yml`.
+A cold Rust build compiles the whole Typst crate graph and takes minutes; incremental
+rebuilds after touching only `src/*.rs` are fast.
 
 ## Architecture
 
-### The pipeline
-
 ```
-Elixir input ──┐
-               │
-  Markdown ────┼─► Folio.parse_markdown (NIF, comrak) ─► [Folio.Content.* structs]
-  DSL structs ─┤                                                       │
-  Document ────┘                                                       ▼
-                                                          Folio.Show.apply  (Elixir-side
-                                                                            show-rule
-                                                                            transforms)
-                                                                       │
-                                                                       ▼
-                                                          Folio.Native.compile_{pdf,svg,png}
-                                                                       │
-                                                                       ▼ (NIF / DirtyCpu)
-                                                          ExContent → typst Content tree
-                                                          ExStyle   → typst Styles
-                                                          → typst-layout → typst-pdf/svg/render
+Elixir                          Rust                            Typst
+──────                          ────                            ─────
+Folio.compile(source, files)
+  └─ Folio.Native.compile_pdf ─► compile_pdf (DirtyCpu)
+                                   ├─ FolioWorld::new ──────────► World impl
+                                   ├─ typst::compile::<PagedDocument>
+                                   └─ typst_pdf::pdf
+                                 {pdf, warnings} ◄────────────── Warned<SourceResult<_>>
 ```
 
-Three top-level inputs flow into the NIF: a list of `%Folio.Content.*{}` nodes, a list of `%Folio.Styles.*{}` rules, and a `%{path => binary}` map of attached files.
+Two Rust files, and that is the whole of it:
 
-### Elixir ↔ Rust struct contract (critical)
+- `native/folio_nif/src/world.rs` — the `World` impl. Fonts and `Library` are built once in
+  a `LazyLock`; the source and file map live on the instance.
+- `native/folio_nif/src/lib.rs` — the NIF entry point, diagnostic formatting, and
+  `catch_nif`.
 
-Every content node and style rule is an Elixir struct that maps **1:1** to a `#[derive(NifStruct)]` in Rust via Rustler's `NifStruct` + `NifUntaggedEnum`:
+### The World
 
-| Elixir | Rust | hand-written? |
-|---|---|---|
-| `lib/folio/content.ex` (`%Folio.Content.Text{}`, `Heading{}`, …) | `src/generated_content_nodes.rs` (`ExText`, `ExHeading`, `ExContent`) | **generated** from `codegen/content_nodes.ex` |
-| `lib/folio/styles.ex` (`%Folio.Styles.PageSize{}`, …) | `src/types.rs` (`ExStyle` variants) | hand-written |
-| `lib/folio/native.ex` (`@spec`s) | `src/generated_nifs.rs` (`#[rustler::nif]` wrappers) | **generated** from `codegen/native.ex` |
+`source/1` serves the entry point plus any attached `.typ` file, so a template can
+`#import` its siblings. `file/1` serves attached bytes, which is how `json("data.json")`
+reaches its data.
 
-Two Rust files are RustQ output and must never be edited directly — `mix rustq.gen` regenerates them from `rustq.exs`, and `mix ci` runs `rustq.gen --check` to catch drift. Editing the generated file instead of the codegen source produces a confusing compile error where the signature reverts on the next build.
+Files live **on the `FolioWorld` instance**, not in a global or thread-local store. Two
+compiles on different dirty schedulers cannot observe each other's attachments. Do not
+reintroduce a global file registry.
 
-When adding or changing a node/style:
+### Determinism is a feature, not an accident
 
-1. Edit the Elixir struct (fields + `@type t`).
-2. Content node → add/edit the `node` entry in `codegen/content_nodes.ex` and run `mix rustq.gen`. Style rule → edit the Rust struct in `types.rs` by hand and add the `ExStyle` variant. Either way `#[module = "Folio.Content.Foo"]` must match the Elixir module name **exactly**, and field names + types must match.
-3. Handle the new variant in `native/folio_nif/src/convert.rs` (ExContent → `typst::foundations::Content`).
-4. If it appears in Markdown, map the corresponding `comrak::NodeValue` in `native/folio_nif/src/mdex_bridge.rs`.
-5. Add a builder function in `lib/folio/dsl.ex`.
-6. Add a `node_type/1` clause and `child_fields` consideration in `lib/folio/show.ex` if the node should be addressable by show rules or contains nested content.
+Three things are deliberate, and changing any of them breaks callers who hash their output:
 
-Changing a NIF's signature means editing `codegen/native.ex`, not `lib/folio/native.ex`'s `@spec` alone — the `@spec` is documentation, the codegen entry is what generates the Rust.
+1. `PdfOptions.timestamp` is `None` — no creation date in the PDF.
+2. Only `typst_assets::fonts()` are loaded. **System fonts are deliberately not consulted.**
+   Loading them makes output depend on what the host machine happens to have installed;
+   the previous architecture did this and silently rendered a different typeface in a slim
+   container than on a developer's Mac.
+3. `World::today/1` returns `None`.
 
-A field-decode mismatch surfaces as `"Could not decode field :X on %ExY{}"` from the NIF; `Folio.format_nif_error/1` rewrites this into a hint about checking the DSL signature.
+### Safety model
 
-### Show rules
+`catch_nif` wraps the NIF body in `catch_unwind` so Rust panics surface as Rustler errors
+rather than crashing the BEAM. **Caveat:** Typst's `comemo` caches are not unwind-safe — a
+panic mid-compile may leave them inconsistent, and restarting the VM is the only fully safe
+recovery. Don't rely on a panic being recoverable.
 
-`Folio.Show.apply/1` runs **in Elixir before the NIF call**. It walks the content tree, extracts every `%Content.ShowRule{}` (regardless of nesting), and applies the transforms bottom-up against `node_type/1`. This emulates Typst's `#show` mechanism without reaching the Typst evaluator. New container nodes that hold child content should expose those children via one of the recognized fields (`:body`, `:children`, `:caption`, `:term`, `:description`, `:supplement`) so the show traversal can reach into them.
+The NIF runs on a `DirtyCpu` scheduler. Layout dominates compile time (~88% by Typst's own
+trace), so a large document occupies that scheduler for its duration.
 
-### Layout convergence and diagnostics
+`Folio.compile/3` runs the **full evaluator**, so Typst source is code and is not safe to
+build from untrusted input. Untrusted values belong in the file map, read via `json()` — a
+value rendered by a fixed template cannot alter the document's structure. This distinction
+is the one to protect when changing the API.
 
-`FolioWorld::layout` mirrors `compile_impl` in `typst/src/lib.rs`. The body and styles are built **once** against an `EmptyIntrospector`, then layout runs in a loop (up to `MAX_ITERS` = 5), each pass feeding the previous document's introspector into a fresh `Engine`. The loop exits when the `comemo::Constraint` validates against the new document's introspector.
+## Typst dependency
 
-This matters because anything Typst resolves in its second pass — page counters, `ref`s, outline entries — reads as empty on a single pass. A single-pass layout silently produces an empty outline and a page counter stuck at 1.
+`native/folio_nif/Cargo.toml` pins **upstream** `typst/typst` at rev `5187e083`. All four
+crates must move together — mixing revs yields incompatible `typst-utils` copies in the dep
+graph.
 
-Diagnostics flow through the `Sink`:
+This rev is a `main` commit, not a release tag: it is the upstream commit that the
+`dannote/typst` fork (which this used to track) was branched from, and v0.14.2's `World`
+API differs enough that the code does not compile against it. The fork existed only to make
+`Bibliography::load` and `FirstLineIndent::new` public for the old struct-building path;
+through the evaluator, `#bibliography(..)` and `#set par(first-line-indent: ..)` are
+ordinary Typst functions, so no fork is needed. Those `pub` bumps have still not landed
+upstream, so do not assume a release tag is a drop-in swap.
 
-- Each attempt gets its own `subsink`; only the sink of the iteration actually kept is merged into the outer one, so diagnostics from discarded passes don't leak.
-- On non-convergence, `typst_library::introspection::analyze` turns the document history into warnings naming *which* introspection failed to settle — hence the history is retained, not just the previous document.
-- `sink.delayed()` is drained and promoted to a hard error. Typst defers some failures so layout can finish (an unresolved `ref` is the common one); dropping the sink swallows them.
-- Warnings are returned from the NIF as `{payload, warnings}` and logged by `Folio.wrap_call/2` via `Logger.warning`. The public API stays `{:ok, result} | {:error, t}`.
+## Conventions
 
-`convert_node` can't return a `Result`, so conversion-time failures (e.g. `raw_typst` that doesn't parse) go through `engine.sink.delay/1` and surface via that same promotion. Prefer this over packing placeholder text into the document — a placeholder renders into the user's PDF *and* reports success.
-
-### File attachment scopes
-
-- `Folio.Document.attach_file/3` — session-scoped. Files live only for that document's compile call; cleared via `clear_session_files()` after the NIF returns. Prefer this for untrusted input.
-- `Folio.register_file/2` / `unregister_file/1` — process-global, persists for the BEAM lifetime. Useful for long-lived assets shared across many compiles.
-
-### NIF safety model
-
-`catch_nif` in `native/folio_nif/src/lib.rs` wraps every NIF body in `catch_unwind` so Rust panics surface as Rustler errors instead of crashing the BEAM. **Caveat documented in that file:** Typst's `comemo` caches and the global file store are not unwind-safe — a panic mid-compile may leave them inconsistent, and the only fully safe recovery is restarting the VM. Don't rely on a NIF panic being recoverable in tests or production.
-
-All NIFs run on `DirtyCpu` schedulers; fonts are loaded once via `typst-assets` and shared across compilations (see `world.rs`).
-
-## Conventions worth knowing
-
-- `use Folio` imports `Folio.DSL`, `Folio.Styles`, and `Folio.Sigil`. The `~MD"""..."""` sigil supports `p` (returns `{:ok, pdf}`), `s` (returns `{:ok, [svg]}`), and no modifier (returns content nodes). Interpolation `#{}` is normal Elixir.
-- DSL builders (`text/2`, `heading/2`, `table/2`, …) raise `ArgumentError` with descriptive messages on bad input rather than silently producing malformed structs.
-- Compile entry points return `{:ok, result} | {:error, Folio.CompileError.t()}`; the parse entry returns `{:ok, nodes} | {:error, Folio.ParseError.t()}`. The bang variants (`parse_markdown!`) raise.
-- `mix.exs` includes only the Typst crates needed for layout/render in the Hex package — `vendor/typst/crates/typst-cli` and `typst-ide` are excluded. The `package` `:files` list and `:exclude_patterns` must stay in sync with what the Rust build needs.
+- `Folio.compile/3` returns `{:ok, pdf} | {:error, Folio.CompileError.t()}`; `compile!/3` raises.
+- Warnings come back from the NIF as the second element of `{pdf, warnings}` and are logged
+  by `Folio.compile/3`. Deferred failures are promoted to errors inside Typst's own
+  compile, so they are not dropped.
+- The Hex package `:files` list must stay in sync with what the Rust build needs.
 - Supported Elixir/OTP per CI: 1.16 / OTP 26 and 1.18 / OTP 27.

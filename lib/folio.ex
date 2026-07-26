@@ -1,228 +1,86 @@
 defmodule Folio do
   @moduledoc """
-  Print-quality PDF from Markdown + Elixir, powered by Typst.
+  Print-quality PDF from Typst, in-process via a Rustler NIF.
 
-      use Folio
+  Folio is a thin adaptor over Typst's own compiler. You supply Typst source
+  and the files it reads; Typst parses, evaluates and lays it out, and you get
+  PDF bytes back. Everything Typst can do — `#set` and `#show` rules, `context`,
+  outlines, references, page counters — works, because none of it is
+  reimplemented here.
 
-      content = ~MD""
-      # Report
+      {:ok, pdf} = Folio.compile("#set page(width: 200pt, height: 100pt)\\nHej")
 
-      Some **bold** content with $x^2$ math.
-      ""
+  ## Files
 
-      {:ok, pdf} = Folio.to_pdf(content)
+  A template reaches its data and its siblings through the file map:
 
-  ## Styles
+      Folio.compile(File.read!("report.typ"), %{
+        "data.json" => JSON.encode!(payload),
+        "markdown.typ" => File.read!("markdown.typ")
+      })
 
-      {:ok, pdf} = Folio.to_pdf("Hello", styles: [
-        Folio.Styles.page_size(width: 595, height: 842),
-        Folio.Styles.font_family(["Helvetica"]),
-      ])
+  Files are scoped to the call. Nothing is registered globally, so concurrent
+  compiles cannot observe each other's attachments.
 
-  ## Document pipeline
+  ## Reproducibility
 
-      doc =
-        Folio.Document.new()
-        |> Folio.Document.attach_file("logo.png", File.read!("logo.png"))
-        |> Folio.Document.add_style(Folio.Styles.page_numbering("1"))
-        |> Folio.Document.add_content("# Hello\\n\\nWorld")
+  The PDF carries no creation timestamp and typesetting is restricted to the
+  fonts embedded in the NIF, so the same source and files produce the same
+  bytes on every machine. `datetime.today()` is unavailable to templates for
+  the same reason — a document that depends on the day it was rendered cannot
+  be re-rendered later and compared against the one that was signed.
 
-      {:ok, pdf} = Folio.to_pdf(doc)
+  ## Untrusted input
 
-  ## File management
-
-  For one-off files, use `register_file/2`. For session-scoped isolation,
-  use `Folio.Document.attach_file/3` — files live only within that document.
-
-  ## Warnings
-
-  Typst raises warnings that don't stop a compile — most notably when
-  introspection-driven content (page counters, refs, outlines) fails to settle
-  within five layout passes. These are emitted through `Logger` at `:warning`
-  level; the compile still returns `{:ok, result}`.
+  `compile/3` runs the Typst evaluator, so **Typst source is code**. Do not
+  build source from untrusted input. Put untrusted values in the file map as
+  data instead: `json("data.json")` in a fixed template renders values, it does
+  not evaluate them.
   """
+
+  alias Folio.CompileError
 
   require Logger
 
-  @doc "Imports `Folio.DSL` and `Folio.Sigil`."
-  defmacro __using__(_opts) do
-    quote do
-      import Folio.DSL
-      import Folio.Styles
-      import Folio.Sigil
-    end
-  end
+  @typedoc "Virtual path to file contents, readable by the template."
+  @type files :: %{optional(String.t()) => binary()}
 
   @doc """
-  Parse markdown into content nodes.
+  Compiles Typst `source` to PDF.
 
-      {:ok, nodes} = Folio.parse_markdown("# Hello\\n\\nWorld")
+  ## Options
 
-  Returns `{:error, Folio.ParseError.t()}` on failure.
+    * `:tagged` — emit a tagged (accessible) PDF. Defaults to `true`, matching
+      Typst's own default. Tagging adds a structure element per table cell, so
+      table-heavy documents shrink considerably with it off.
+
+  Warnings from the compiler are logged; the return value is the PDF or an
+  error carrying the diagnostics.
   """
-  @spec parse_markdown(String.t()) :: {:ok, [Folio.Content.t()]} | {:error, Folio.ParseError.t()}
-  def parse_markdown(markdown) when is_binary(markdown) do
-    {:ok, Folio.Native.parse_markdown(markdown)}
+  @spec compile(String.t(), files(), keyword()) :: {:ok, binary()} | {:error, CompileError.t()}
+  def compile(source, files \\ %{}, opts \\ [])
+      when is_binary(source) and is_map(files) and is_list(opts) do
+    tagged = Keyword.get(opts, :tagged, true)
+    {pdf, warnings} = Folio.Native.compile_pdf(source, files, tagged)
+
+    Enum.each(warnings, &Logger.warning("typst: #{&1}"))
+
+    {:ok, pdf}
   rescue
-    e in ErlangError ->
-      {:error, Folio.ParseError.new(Exception.message(e))}
+    error in ErlangError -> {:error, CompileError.new(describe(error))}
   end
 
   @doc """
-  Parse markdown into content nodes, raising on error.
-
-      nodes = Folio.parse_markdown!("# Hello\\n\\nWorld")
-
-  Raises `Folio.ParseError` on failure.
+  Compiles Typst `source` to PDF, raising `Folio.CompileError` on failure.
   """
-  @spec parse_markdown!(String.t()) :: [Folio.Content.t()]
-  def parse_markdown!(markdown) when is_binary(markdown) do
-    case parse_markdown(markdown) do
-      {:ok, nodes} -> nodes
+  @spec compile!(String.t(), files(), keyword()) :: binary()
+  def compile!(source, files \\ %{}, opts \\ []) do
+    case compile(source, files, opts) do
+      {:ok, pdf} -> pdf
       {:error, error} -> raise error
     end
   end
 
-  @type source :: String.t() | [Folio.Content.t()] | Folio.Document.t()
-  @type compile_result(result) :: {:ok, result} | {:error, Folio.CompileError.t()}
-
-  @doc """
-  Compile to PDF bytes.
-
-  Accepts markdown strings, content node lists, or `Folio.Document` structs.
-
-      {:ok, pdf} = Folio.to_pdf("# Hello")
-      {:ok, pdf} = Folio.to_pdf(doc)
-  """
-  @spec to_pdf(source(), keyword()) :: compile_result(binary())
-  def to_pdf(source, opts \\ [])
-
-  def to_pdf(source, opts) do
-    with {:ok, {content, styles, files}} <- normalize_source(source, opts) do
-      wrap_call(
-        fn -> Folio.Native.compile_pdf(content, styles, files) end,
-        &Folio.CompileError.new/1
-      )
-    end
-  end
-
-  @doc """
-  Compile to SVG strings (one per page).
-
-      {:ok, [page1_svg, page2_svg]} = Folio.to_svg("# Hello")
-  """
-  @spec to_svg(source(), keyword()) :: compile_result([String.t()])
-  def to_svg(source, opts \\ [])
-
-  def to_svg(source, opts) do
-    with {:ok, {content, styles, files}} <- normalize_source(source, opts) do
-      wrap_call(
-        fn -> Folio.Native.compile_svg(content, styles, files) end,
-        &Folio.CompileError.new/1
-      )
-    end
-  end
-
-  @doc """
-  Compile to PNG images (one per page).
-
-  Each page is rendered and encoded independently so peak memory
-  is proportional to the largest page, not the total page count.
-
-      {:ok, [page1_png, page2_png]} = Folio.to_png("# Hello")
-      {:ok, pngs} = Folio.to_png("# Hello", dpi: 3.0)
-
-  Options:
-
-    * `:dpi` — render scale factor (default: `2.0`).
-      `1.0` = 72 DPI, `2.0` = 144 DPI, `3.0` = 216 DPI.
-  """
-  @spec to_png(source(), keyword()) :: compile_result([binary()])
-  def to_png(source, opts \\ [])
-
-  def to_png(source, opts) do
-    dpi = Keyword.get(opts, :dpi, 2.0)
-
-    with {:ok, {content, styles, files}} <- normalize_source(source, opts) do
-      wrap_call(
-        fn -> Folio.Native.compile_png(content, styles, files, dpi) end,
-        &Folio.CompileError.new/1
-      )
-    end
-  end
-
-  @doc """
-  Register a file globally for use in documents (images, bibliography, etc).
-
-  Files registered here are shared across all compile calls for the
-  lifetime of the BEAM VM. For session-scoped isolation, prefer
-  `Folio.Document.attach_file/3` instead.
-  """
-  @spec register_file(String.t(), binary()) :: :ok
-  def register_file(path, data) when is_binary(path) and is_binary(data) do
-    Folio.Native.register_file(path, data)
-    :ok
-  end
-
-  @doc """
-  Unregister a previously registered global file, freeing its memory.
-
-      Folio.unregister_file("chart.png")
-  """
-  @spec unregister_file(String.t()) :: :ok
-  def unregister_file(path) when is_binary(path) do
-    Folio.Native.unregister_file(path)
-    :ok
-  end
-
-  @spec normalize_source(source(), keyword()) ::
-          {:ok, {[Folio.Content.t()], [Folio.Styles.rule()], %{String.t() => binary()}}}
-          | {:error, Folio.ParseError.t()}
-  defp normalize_source(
-         %Folio.Document{content: content, styles: doc_styles, files: doc_files},
-         opts
-       ) do
-    content = Folio.Show.apply(content)
-    opts_styles = Keyword.get(opts, :styles, [])
-    {:ok, {content, opts_styles ++ doc_styles, doc_files}}
-  end
-
-  defp normalize_source(markdown, opts) when is_binary(markdown) do
-    case parse_markdown(markdown) do
-      {:ok, nodes} ->
-        nodes = Folio.Show.apply(nodes)
-        {:ok, {nodes, Keyword.get(opts, :styles, []), %{}}}
-
-      {:error, _} = err ->
-        err
-    end
-  end
-
-  defp normalize_source(content, opts) when is_list(content) do
-    content = Folio.Show.apply(content)
-    {:ok, {content, Keyword.get(opts, :styles, []), %{}}}
-  end
-
-  @spec wrap_call((-> {result, [String.t()]}), (String.t() -> exception)) ::
-          {:ok, result} | {:error, exception}
-        when result: var, exception: Exception.t()
-  defp wrap_call(fun, error_builder) do
-    {result, warnings} = fun.()
-    Enum.each(warnings, &Logger.warning("Folio: " <> &1))
-    {:ok, result}
-  rescue
-    e in ErlangError ->
-      reason = format_nif_error(Exception.message(e))
-      {:error, error_builder.(reason)}
-  end
-
-  defp format_nif_error(msg) do
-    case Regex.run(~r/Could not decode field :(\w+) on %Ex(\w+)\{\}/, msg) do
-      [_, field, type] ->
-        "invalid value for #{type}.#{field} — check that the field type matches the DSL function signature"
-
-      _ ->
-        msg
-    end
-  end
+  defp describe(%ErlangError{original: original}) when is_binary(original), do: original
+  defp describe(error), do: Exception.message(error)
 end

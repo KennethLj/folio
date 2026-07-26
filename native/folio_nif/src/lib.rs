@@ -1,29 +1,24 @@
-mod types;
-mod convert;
-mod mdex_bridge;
 mod world;
 
+use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 
 use rustler::{Env, NifResult, OwnedBinary};
-
-rustler::atoms!(ok);
+use typst::diag::{SourceDiagnostic, Warned};
+use typst::foundations::Smart;
+use typst_layout::PagedDocument;
+use typst_pdf::{pdf, PdfOptions};
 
 use world::FolioWorld;
-use world as world_mod;
-use types::{ExContent, ExStyle};
-
-include!("generated_nifs.rs");
 
 /// Wrap a NIF body in `catch_unwind` so Rust panics become structured
 /// Rustler errors instead of crashing the BEAM.
 ///
 /// # Safety
 ///
-/// Typst's internal caches (comemo, etc.) are not unwind-safe. A panic
-/// during compilation may leave the global file store or comemo caches
-/// in an inconsistent state, potentially corrupting subsequent compilations.
-/// If a panic occurs, restarting the BEAM VM is the only fully safe recovery.
+/// Typst's `comemo` caches are not unwind-safe. A panic during compilation may
+/// leave them inconsistent, and restarting the BEAM VM is the only fully safe
+/// recovery. Do not rely on a panic here being recoverable.
 fn catch_nif<F, T>(label: &str, f: F) -> NifResult<T>
 where
     F: FnOnce() -> NifResult<T>,
@@ -43,101 +38,76 @@ where
     }
 }
 
-fn parse_markdown_impl(markdown: String) -> NifResult<Vec<ExContent>> {
-    catch_nif("parse_markdown", || {
-        let arena = typed_arena::Arena::new();
-        let mut options = comrak::Options::default();
-        options.extension.table = true;
-        options.extension.strikethrough = true;
-        options.extension.autolink = true;
-        options.extension.math_dollars = true;
-        options.extension.strikethrough = true;
-        options.extension.table = true;
-        options.extension.autolink = true;
-        options.extension.description_lists = true;
-        options.extension.tasklist = true;
-
-        let root = comrak::parse_document(&arena, &markdown, &options);
-        Ok(mdex_bridge::convert_children(root))
-    })
-}
-
-fn compile_pdf_impl<'a>(
+/// Compile Typst `source` to PDF.
+///
+/// `files` maps virtual paths to bytes, and is how a template reaches its
+/// data (`json("data.json")`) and its siblings (`#import "markdown.typ"`).
+/// Returns the PDF alongside any warnings, which the caller logs.
+///
+/// The PDF carries no creation timestamp, so the same source and files always
+/// produce the same bytes.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn compile_pdf<'a>(
     env: Env<'a>,
-    content: Vec<ExContent>,
-    styles: Vec<ExStyle>,
-    files: std::collections::HashMap<String, rustler::Binary<'a>>,
+    source: String,
+    files: HashMap<String, rustler::Binary<'a>>,
+    tagged: bool,
 ) -> NifResult<(rustler::Binary<'a>, Vec<String>)> {
     catch_nif("compile_pdf", || {
-        let session_files = decode_file_map(files);
-        let world = FolioWorld::new(styles, session_files);
-        let result = world
-            .compile_to_pdf(&content)
-            .map_err(|msg| rustler::Error::RaiseTerm(Box::new(msg)));
-        world_mod::clear_session_files();
-        let (bytes, warnings) = result?;
-        Ok((alloc_binary(env, &bytes)?, warnings))
+        let files = files
+            .into_iter()
+            .map(|(path, data)| (path, data.as_slice().to_vec()))
+            .collect();
+
+        let world = FolioWorld::new(source, files);
+        let Warned { output, warnings } = typst::compile::<PagedDocument>(&world);
+
+        let document = output.map_err(diagnostics_error)?;
+
+        let options = PdfOptions {
+            ident: Smart::Auto,
+            timestamp: None,
+            page_ranges: None,
+            standards: Default::default(),
+            tagged,
+        };
+
+        let bytes = pdf(&document, &options).map_err(diagnostics_error)?;
+
+        Ok((alloc_binary(env, &bytes)?, format_all(&warnings)))
     })
 }
 
-fn compile_svg_impl<'a>(
-    content: Vec<ExContent>,
-    styles: Vec<ExStyle>,
-    files: std::collections::HashMap<String, rustler::Binary<'a>>,
-) -> NifResult<(Vec<String>, Vec<String>)> {
-    catch_nif("compile_svg", || {
-        let session_files = decode_file_map(files);
-        let world = FolioWorld::new(styles, session_files);
-        let result = world
-            .compile_to_svg(&content)
-            .map_err(|msg| rustler::Error::RaiseTerm(Box::new(msg)));
-        world_mod::clear_session_files();
-        result
-    })
+fn diagnostics_error(diagnostics: impl IntoIterator<Item = SourceDiagnostic>) -> rustler::Error {
+    let messages: Vec<String> = diagnostics
+        .into_iter()
+        .map(|d| format_diagnostic(&d))
+        .collect();
+
+    rustler::Error::RaiseTerm(Box::new(messages.join("\n")))
 }
 
-/// Compile to PNG. Each page is rendered and encoded independently so peak
-/// memory is proportional to the largest page, not the total document.
-/// `dpi` is the render scale factor (1.0 = 72 DPI, 2.0 = 144 DPI, etc.).
-fn compile_png_impl<'a>(
-    env: Env<'a>,
-    content: Vec<ExContent>,
-    styles: Vec<ExStyle>,
-    files: std::collections::HashMap<String, rustler::Binary<'a>>,
-    dpi: f64,
-) -> NifResult<(Vec<rustler::Binary<'a>>, Vec<String>)> {
-    catch_nif("compile_png", || {
-        let session_files = decode_file_map(files);
-        let world = FolioWorld::new(styles, session_files);
-        let result = world
-            .compile_to_png(&content, dpi)
-            .map_err(|msg| rustler::Error::RaiseTerm(Box::new(msg)));
-        world_mod::clear_session_files();
-        let (pages, warnings) = result?;
-        let binaries: Vec<rustler::Binary<'a>> =
-            pages.iter().map(|b| alloc_binary(env, b)).collect::<NifResult<_>>()?;
-        Ok((binaries, warnings))
-    })
+fn format_all(diagnostics: &[SourceDiagnostic]) -> Vec<String> {
+    diagnostics.iter().map(format_diagnostic).collect()
 }
 
-fn register_file_impl(path: String, data: rustler::Binary) -> rustler::Atom {
-    world_mod::register_file(path, data.as_slice().to_vec());
-    ok()
-}
+fn format_diagnostic(diagnostic: &SourceDiagnostic) -> String {
+    let mut out = diagnostic.message.to_string();
 
-fn unregister_file_impl(path: String) -> rustler::Atom {
-    world_mod::unregister_file(path);
-    ok()
-}
+    for hint in &diagnostic.hints {
+        out.push_str("\n  hint: ");
+        out.push_str(&hint.v);
+    }
 
-fn decode_file_map(files: std::collections::HashMap<String, rustler::Binary<'_>>) -> std::collections::HashMap<String, Vec<u8>> {
-    files.into_iter().map(|(k, v)| (k, v.as_slice().to_vec())).collect()
+    out
 }
 
 fn alloc_binary<'a>(env: Env<'a>, bytes: &[u8]) -> NifResult<rustler::Binary<'a>> {
     let mut binary = OwnedBinary::new(bytes.len())
         .ok_or(rustler::Error::Term(Box::new("failed to allocate binary")))?;
+
     binary.as_mut_slice().copy_from_slice(bytes);
+
     Ok(binary.release(env))
 }
 

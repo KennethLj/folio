@@ -1,33 +1,12 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::str::FromStr;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::LazyLock;
 
-use typst::comemo::{Constraint, Track, TrackedMut};
-use typst::diag::{FileError, FileResult, SourceDiagnostic};
-use typst::engine::{Engine, Route, Sink, Traced};
-use typst::foundations::{
-    Bytes, Content, Context, Datetime, Derived, Duration, NativeElement, Output, Smart,
-    StyleChain, Styles, Target, TargetElem,
-};
-use typst::introspection::{analyze, EmptyIntrospector, Introspector, MAX_ITERS};
-use typst::layout::{Abs, Margin, Sides};
-use typst::layout::PageElem;
-use typst::loading::{DataSource, LoadSource, Loaded};
-use typst::math::EquationElem;
-use typst::syntax::{FileId, RootedPath, Source, Span, Spanned, SyntaxMode, VirtualPath, VirtualRoot};
-use typst::text::{Font, FontBook, TextElem, TextSize};
+use typst::diag::{FileError, FileResult};
+use typst::foundations::{Bytes, Datetime, Duration};
+use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
+use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
 use typst::{Features, Library, LibraryExt, World};
-use typst_layout::layout_document;
-use typst_pdf::{PdfOptions, pdf};
-use typst_svg::svg;
-use typst_render::render;
-use ecow::eco_format;
-
-use crate::convert::build_content;
-use crate::types::{ExContent, ExStyle};
-use typst::model::{HeadingElem, Numbering, NumberingPattern, Supplement};
 
 struct GlobalState {
     library: LazyHash<Library>,
@@ -36,431 +15,101 @@ struct GlobalState {
     main_id: FileId,
 }
 
-fn load_system_fonts() -> Vec<Font> {
-    let mut db = fontdb::Database::new();
-    db.load_system_fonts();
-
-    let mut fonts = Vec::new();
-    for face in db.faces() {
-        let _ = db.with_face_data(face.id, |data, index| {
-            let bytes = Bytes::new(data.to_vec());
-            for font in Font::iter(bytes) {
-                if font.index() == index {
-                    fonts.push(font);
-                }
-            }
-        });
-    }
-    fonts
-}
-
+/// Fonts, library and the main file id, built once and shared across compiles.
+///
+/// Only the fonts embedded in `typst-assets` are loaded. System fonts are
+/// deliberately *not* consulted: whichever fonts a laptop or a container image
+/// happens to carry would otherwise change the metrics, the pagination and
+/// therefore the bytes of a document, and callers who hash their output need
+/// the same input to render the same PDF everywhere. This mirrors the CLI's
+/// `--ignore-system-fonts`.
 static GLOBAL: LazyLock<GlobalState> = LazyLock::new(|| {
-    let mut fonts: Vec<Font> = typst_assets::fonts()
+    let fonts: Vec<Font> = typst_assets::fonts()
         .flat_map(|data| Font::iter(Bytes::new(data)))
         .collect();
-    fonts.extend(load_system_fonts());
     let book = LazyHash::new(FontBook::from_fonts(&fonts));
-    let library = LazyHash::new(
-        Library::builder()
-            .with_features(Features::all())
-            .build(),
-    );
-    let main_id = RootedPath::new(
-        VirtualRoot::Project,
-        VirtualPath::new("main.typ").unwrap(),
-    )
-    .intern();
-    GlobalState { library, fonts, book, main_id }
+    let library = LazyHash::new(Library::builder().with_features(Features::all()).build());
+    let main_id =
+        RootedPath::new(VirtualRoot::Project, VirtualPath::new("main.typ").unwrap()).intern();
+
+    GlobalState {
+        library,
+        fonts,
+        book,
+        main_id,
+    }
 });
 
-type FileStore = Arc<Mutex<HashMap<String, Vec<u8>>>>;
-
-/// Global fallback file store for `register_file`/`unregister_file`.
-static GLOBAL_FILE_STORE: LazyLock<FileStore> =
-    LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
-
-pub fn register_file(path: String, data: Vec<u8>) {
-    GLOBAL_FILE_STORE.lock().unwrap().insert(path, data);
-}
-
-pub fn unregister_file(path: String) {
-    GLOBAL_FILE_STORE.lock().unwrap().remove(&path);
-}
-
-thread_local! {
-    static SESSION_FILES: RefCell<HashMap<String, Vec<u8>>> = RefCell::new(HashMap::new());
-}
-
-pub fn set_session_files(files: HashMap<String, Vec<u8>>) {
-    SESSION_FILES.with(|cell| *cell.borrow_mut() = files);
-}
-
-pub fn clear_session_files() {
-    SESSION_FILES.with(|cell| cell.borrow_mut().clear());
-}
-
-/// Look up file data: session files first, then global store.
-pub fn get_file_data(src: &str) -> Option<Vec<u8>> {
-    SESSION_FILES.with(|cell| {
-        if let Some(data) = cell.borrow().get(src) {
-            return Some(data.clone());
-        }
-        None
-    }).or_else(|| GLOBAL_FILE_STORE.lock().unwrap().get(src).cloned())
-}
-
+/// A `World` over an in-memory source and file map.
+///
+/// Attached files live on the instance rather than in a global or
+/// thread-local store, so two compiles running concurrently on different dirty
+/// schedulers cannot observe each other's files.
 pub struct FolioWorld {
-    styles: Vec<ExStyle>,
+    main: Source,
+    files: HashMap<String, Bytes>,
 }
 
 impl FolioWorld {
-    pub fn new(styles: Vec<ExStyle>, session_files: HashMap<String, Vec<u8>>) -> Self {
-        set_session_files(session_files);
-        Self { styles }
-    }
-
-    pub fn compile_to_pdf(&self, content: &[ExContent]) -> Result<(Vec<u8>, Vec<String>), String> {
-        let (doc, warnings) = self.layout(content)?;
-        let bytes = pdf(&doc, &PdfOptions {
-            ident: Smart::Auto,
-            timestamp: None,
-            page_ranges: None,
-            standards: Default::default(),
-            tagged: false,
-        })
-        .map_err(|e| format!("PDF export error: {:?}", e))?;
-        Ok((bytes, warnings))
-    }
-
-    pub fn compile_to_svg(&self, content: &[ExContent]) -> Result<(Vec<String>, Vec<String>), String> {
-        let (doc, warnings) = self.layout(content)?;
-        Ok((doc.pages().iter().map(svg).collect(), warnings))
-    }
-
-    /// Render each page to PNG at the given DPI scale.
-    /// Peak memory is proportional to the largest page, not the total document.
-    pub fn compile_to_png(&self, content: &[ExContent], dpi: f64) -> Result<(Vec<Vec<u8>>, Vec<String>), String> {
-        let scale = if dpi <= 0.0 { 2.0 } else { dpi };
-        let (doc, warnings) = self.layout(content)?;
-        let pages: Vec<Vec<u8>> = doc.pages().iter().map(|p| {
-            render(p, scale as f32).encode_png().map_err(|e| format!("PNG encode error: {:?}", e))
-        }).collect::<Result<_, _>>()?;
-        Ok((pages, warnings))
-    }
-
-    /// Lay out the document, returning it alongside any diagnostics Typst
-    /// raised along the way.
-    ///
-    /// Mirrors `compile_impl` in `typst/src/lib.rs`: build the body once, then
-    /// relayout until introspection stabilizes. Each attempt gets its own sink
-    /// so that diagnostics from discarded iterations don't leak into the
-    /// result — only the sink of the iteration we actually keep is merged.
-    fn layout(
-        &self,
-        content: &[ExContent],
-    ) -> Result<(typst_layout::PagedDocument, Vec<String>), String> {
-        let traced = Traced::default();
-        let empty = EmptyIntrospector;
-        let mut sink = Sink::new();
-
-        let (body, user_styles) = {
-            let mut engine = Engine {
-                routines: &typst::ROUTINES,
-                world: Track::track(self),
-                introspector: typst::utils::Protected::new(empty.track()),
-                traced: traced.track(),
-                sink: sink.track_mut(),
-                route: Route::root(),
-            };
-            let body = build_content(&mut engine, content);
-            let mut styles = typst::foundations::Styles::new();
-            apply_styles(&mut styles, &self.styles, &mut engine);
-            (body, styles)
-        };
-
-        let lib = &GLOBAL.library;
-        let base = StyleChain::new(&lib.styles);
-        let target_style: Styles = TargetElem::target.set(Target::Paged).wrap().into();
-        let chained = base.chain(&target_style);
-        let styles = chained.chain(&user_styles);
-
-        // At most MAX_ITERS - 1 documents are retained; the final attempt is
-        // kept in `doc`. `analyze` needs the whole history to say *which*
-        // introspection failed to settle.
-        let mut history: Vec<typst_layout::PagedDocument> = Vec::new();
-        let doc = loop {
-            let constraint = Constraint::new();
-            let mut subsink = Sink::new();
-            let doc = {
-                let introspector: &dyn Introspector = match history.last() {
-                    Some(doc) => Output::introspector(doc),
-                    None => &empty,
-                };
-                let mut engine = Engine {
-                    routines: &typst::ROUTINES,
-                    world: Track::track(self),
-                    introspector: typst::utils::Protected::new(introspector.track_with(&constraint)),
-                    traced: traced.track(),
-                    sink: subsink.track_mut(),
-                    route: Route::root(),
-                };
-                layout_document(&mut engine, &body, styles)
-                    .map_err(|e| format!("Layout error: {:?}", e))?
-            };
-
-            if constraint.validate(Output::introspector(&doc)) {
-                sink.extend_from_sink(subsink);
-                break doc;
-            }
-
-            if history.len() == MAX_ITERS - 1 {
-                let mut introspectors = [&empty as &dyn Introspector; MAX_ITERS + 1];
-                for (i, prev) in history.iter().enumerate() {
-                    introspectors[i + 1] = Output::introspector(prev);
-                }
-                introspectors[MAX_ITERS] = Output::introspector(&doc);
-
-                let warnings = analyze(
-                    Track::track(self),
-                    &typst::ROUTINES,
-                    introspectors,
-                    subsink.introspections(),
-                );
-
-                sink.extend_from_sink(subsink);
-                for warning in warnings {
-                    sink.warn(warning);
-                }
-                break doc;
-            }
-
-            history.push(doc);
-        };
-
-        // Typst defers some errors so that layout can finish; promote them now,
-        // otherwise they would vanish along with the sink.
-        let delayed = sink.delayed();
-        if !delayed.is_empty() {
-            let messages: Vec<String> = delayed.iter().map(format_diagnostic).collect();
-            return Err(format!("Layout error: {}", messages.join("; ")));
-        }
-
-        Ok((doc, sink.warnings().iter().map(format_diagnostic).collect()))
-    }
-
-    pub fn eval_math(engine: &mut Engine, math_str: &str, block: bool) -> Content {
-        let result = typst_eval::eval_string(
-            engine.routines,
-            engine.world,
-            TrackedMut::reborrow_mut(&mut engine.sink),
-            engine.introspector.into_raw(),
-            Context::none().track(),
-            math_str,
-            Span::detached(),
-            SyntaxMode::Math,
-            typst::foundations::Scope::new(),
-        );
-
-        match result {
-            Ok(value) => match value.cast::<Content>() {
-                Ok(content) => EquationElem::new(content).with_block(block).pack(),
-                Err(_) => TextElem::packed(eco_format!("${}$", math_str)),
-            },
-            Err(_) => TextElem::packed(eco_format!("${}$", math_str)),
-        }
-    }
-}
-
-/// Render a diagnostic as a flat string.
-///
-/// Spans are dropped deliberately: folio never builds content from Typst
-/// source, so every span is detached and would only ever point at nothing.
-fn format_diagnostic(diag: &SourceDiagnostic) -> String {
-    let mut out = diag.message.to_string();
-    for hint in &diag.hints {
-        out.push_str("\n  hint: ");
-        out.push_str(&hint.v);
-    }
-    out
-}
-
-pub(crate) fn get_image_source(src: &str) -> Option<Derived<DataSource, Loaded>> {
-    let data = get_file_data(src)?;
-    let bytes = Bytes::new(data);
-    let loaded = Loaded::new(
-        Spanned::new(LoadSource::Bytes, Span::detached()),
-        bytes.clone(),
-    );
-    Some(Derived::new(DataSource::Bytes(bytes), loaded))
-}
-
-fn style_content(engine: &mut Engine, nodes: &[ExContent]) -> Content {
-    build_content(engine, nodes)
-}
-
-fn apply_styles(styles: &mut typst::foundations::Styles, user_styles: &[ExStyle], engine: &mut Engine) {
-    for s in user_styles {
-        match s {
-            ExStyle::PageSize(sz) => {
-                if let Some(w) = sz.width {
-                    styles.set(PageElem::width, Smart::Custom(Abs::pt(w).into()));
-                }
-                if let Some(h) = sz.height {
-                    styles.set(PageElem::height, Smart::Custom(Abs::pt(h).into()));
-                }
-            }
-            ExStyle::PageMargin(m) => {
-                let side = |v: Option<f64>| v.map(|x| Smart::Custom(Abs::pt(x).into()));
-                if m.top.is_none() && m.right.is_none() && m.bottom.is_none() && m.left.is_none() {
-                } else {
-                    styles.set(PageElem::margin, Margin {
-                        sides: Sides {
-                            top: side(m.top),
-                            right: side(m.right),
-                            bottom: side(m.bottom),
-                            left: side(m.left),
-                        },
-                        two_sided: None,
-                    });
-                }
-            }
-            ExStyle::FontSize(fs) => {
-                styles.set(TextElem::size, TextSize(Abs::pt(fs.size).into()));
-            }
-            ExStyle::FontFamily(ff) => {
-                let families: typst::text::FontList = typst::text::FontList(
-                    ff.families.iter()
-                        .map(|s| typst::text::FontFamily::new(s))
-                        .collect());
-                styles.set(TextElem::font, families);
-            }
-            ExStyle::FontWeight(fw) => {
-                styles.set(TextElem::weight, typst::text::FontWeight::from_number(fw.weight));
-            }
-            ExStyle::TextColor(tc) => {
-                if let Some(color) = crate::convert::parse_color(&tc.color) {
-                    styles.set(TextElem::fill, typst::visualize::Paint::Solid(color));
-                }
-            }
-            ExStyle::ParJustify(pj) => {
-                styles.set(typst::model::ParElem::justify, pj.justify);
-            }
-            ExStyle::ParIndent(pi) => {
-                let fli = typst::model::FirstLineIndent::new(
-                    Some(Abs::pt(pi.indent).into()),
-                    pi.all.map(|a| if a { Some(true) } else { None }).flatten(),
-                );
-                styles.set(typst::model::ParElem::first_line_indent, fli);
-            }
-            ExStyle::PageNumbering(pn) => {
-                if let Ok(pat) = NumberingPattern::from_str(&pn.pattern) {
-                    styles.set(PageElem::numbering, Some(Numbering::Pattern(pat)));
-                }
-            }
-            ExStyle::PageHeader(ph) => {
-                styles.set(PageElem::header, Smart::Custom(Some(style_content(engine, &ph.content))));
-            }
-            ExStyle::PageFooter(pf) => {
-                styles.set(PageElem::footer, Smart::Custom(Some(style_content(engine, &pf.content))));
-            }
-            ExStyle::HeadingNumbering(hn) => {
-                if let Ok(pat) = NumberingPattern::from_str(&hn.pattern) {
-                    styles.set(HeadingElem::numbering, Some(Numbering::Pattern(pat)));
-                }
-            }
-            ExStyle::HeadingSupplement(hs) => {
-                styles.set(
-                    HeadingElem::supplement,
-                    Smart::Custom(Some(Supplement::Content(style_content(engine, &hs.content)))),
-                );
-            }
-            ExStyle::HeadingOutlined(ho) => {
-                styles.set(HeadingElem::outlined, ho.outlined);
-            }
-            ExStyle::HeadingBookmarked(hb) => {
-                styles.set(HeadingElem::bookmarked, Smart::Custom(hb.bookmarked));
-            }
-            ExStyle::Lang(l) => {
-                if let Ok(lang) = std::str::FromStr::from_str(&l.lang) {
-                    styles.set(TextElem::lang, lang);
-                }
-            }
-            ExStyle::Hyphenate(h) => {
-                styles.set(TextElem::hyphenate, Smart::Custom(h.hyphenate));
-            }
-            ExStyle::Leading(l) => {
-                styles.set(
-                    typst::model::ParElem::leading,
-                    typst::layout::Length { abs: Abs::zero(), em: typst::layout::Em::new(l.leading) },
-                );
-            }
-            ExStyle::ParSpacing(s) => {
-                styles.set(
-                    typst::model::ParElem::spacing,
-                    typst::layout::Length { abs: Abs::zero(), em: typst::layout::Em::new(s.spacing) },
-                );
-            }
-            ExStyle::EnumIndent(e) => {
-                styles.set(
-                    typst::model::EnumElem::indent,
-                    typst::layout::Length { abs: Abs::pt(e.indent), em: typst::layout::Em::zero() },
-                );
-            }
-            ExStyle::EnumBodyIndent(e) => {
-                styles.set(
-                    typst::model::EnumElem::body_indent,
-                    typst::layout::Length { abs: Abs::pt(e.body_indent), em: typst::layout::Em::zero() },
-                );
-            }
-            ExStyle::EnumItemSpacing(e) => {
-                styles.set(
-                    typst::model::EnumElem::spacing,
-                    Smart::Custom(typst::layout::Length { abs: Abs::zero(), em: typst::layout::Em::new(e.spacing) }),
-                );
-            }
-            ExStyle::ListIndent(l) => {
-                styles.set(
-                    typst::model::ListElem::indent,
-                    typst::layout::Length { abs: Abs::pt(l.indent), em: typst::layout::Em::zero() },
-                );
-            }
-            ExStyle::ListBodyIndent(l) => {
-                styles.set(
-                    typst::model::ListElem::body_indent,
-                    typst::layout::Length { abs: Abs::pt(l.body_indent), em: typst::layout::Em::zero() },
-                );
-            }
-            ExStyle::ListItemSpacing(l) => {
-                styles.set(
-                    typst::model::ListElem::spacing,
-                    Smart::Custom(typst::layout::Length { abs: Abs::zero(), em: typst::layout::Em::new(l.spacing) }),
-                );
-            }
+    pub fn new(source: String, files: HashMap<String, Vec<u8>>) -> Self {
+        Self {
+            main: Source::new(GLOBAL.main_id, source),
+            files: files
+                .into_iter()
+                .map(|(path, data)| (path, Bytes::new(data)))
+                .collect(),
         }
     }
 }
 
 impl World for FolioWorld {
-    fn library(&self) -> &LazyHash<Library> { &GLOBAL.library }
-    fn book(&self) -> &LazyHash<FontBook> { &GLOBAL.book }
-    fn main(&self) -> FileId { GLOBAL.main_id }
+    fn library(&self) -> &LazyHash<Library> {
+        &GLOBAL.library
+    }
 
+    fn book(&self) -> &LazyHash<FontBook> {
+        &GLOBAL.book
+    }
+
+    fn main(&self) -> FileId {
+        GLOBAL.main_id
+    }
+
+    /// Serves the entry point, plus any attached `.typ` file so a template can
+    /// `#import` its siblings.
     fn source(&self, id: FileId) -> FileResult<Source> {
         if id == GLOBAL.main_id {
-            Ok(Source::new(GLOBAL.main_id, String::new()))
-        } else {
-            Err(FileError::NotFound(id.vpath().get_without_slash().into()))
+            return Ok(self.main.clone());
         }
+
+        let path = id.vpath().get_without_slash();
+        let bytes = self
+            .files
+            .get(path)
+            .ok_or_else(|| FileError::NotFound(path.into()))?;
+
+        let text = std::str::from_utf8(bytes).map_err(|_| FileError::InvalidUtf8)?;
+
+        Ok(Source::new(id, text.to_string()))
     }
 
     fn file(&self, id: FileId) -> FileResult<Bytes> {
         let path = id.vpath().get_without_slash();
-        match get_file_data(path) {
-            Some(data) => Ok(Bytes::new(data)),
-            None => Err(FileError::NotFound(path.into())),
-        }
+
+        self.files
+            .get(path)
+            .cloned()
+            .ok_or_else(|| FileError::NotFound(path.into()))
     }
 
-    fn font(&self, index: usize) -> Option<Font> { GLOBAL.fonts.get(index).cloned() }
-    fn today(&self, _offset: Option<Duration>) -> Option<Datetime> { None }
+    fn font(&self, index: usize) -> Option<Font> {
+        GLOBAL.fonts.get(index).cloned()
+    }
+
+    /// `None` keeps `datetime.today()` unavailable to templates. A document
+    /// whose content depends on the day it was rendered cannot be re-rendered
+    /// later and compared against the one that was signed.
+    fn today(&self, _offset: Option<Duration>) -> Option<Datetime> {
+        None
+    }
 }

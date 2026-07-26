@@ -10,24 +10,24 @@ crate-type = ["cdylib"]
 
 [dependencies]
 rustler = "0.37"
-# Fork = upstream typst + 6 lines exposing `Bibliography::load` and
-# `FirstLineIndent::new` for embedders. Once upstreamed, switch back to
-# `github.com/typst/typst` and drop the fork.
-typst         = { git = "https://github.com/dannote/typst", rev = "452eba4e4" }
-typst-library = { git = "https://github.com/dannote/typst", rev = "452eba4e4" }
-typst-layout  = { git = "https://github.com/dannote/typst", rev = "452eba4e4" }
-typst-pdf     = { git = "https://github.com/dannote/typst", rev = "452eba4e4" }
-typst-svg     = { git = "https://github.com/dannote/typst", rev = "452eba4e4" }
-typst-render  = { git = "https://github.com/dannote/typst", rev = "452eba4e4" }
-typst-syntax  = { git = "https://github.com/dannote/typst", rev = "452eba4e4" }
-typst-eval    = { git = "https://github.com/dannote/typst", rev = "452eba4e4" }
+# Upstream typst.
+#
+# Pinned to 5187e083, which is the upstream commit the fork this used to track
+# was branched from — same API surface, no fork. Note this is a `main` commit
+# rather than a release tag: it is newer than v0.14.2, whose `World` API differs.
+#
+# This used to track a fork that made `Bibliography::load` and
+# `FirstLineIndent::new` public, because the old struct-building path
+# constructed those types directly from the embedder. Those bumps are still not
+# in an upstream release (`fn load` is private in v0.14.2), so the fork was not
+# obsolete — it is simply no longer needed: reaching Typst through its
+# evaluator, `#bibliography(..)` and `#set par(first-line-indent: ..)` are
+# ordinary Typst functions.
+typst         = { git = "https://github.com/typst/typst", rev = "5187e083" }
+typst-library = { git = "https://github.com/typst/typst", rev = "5187e083" }
+typst-layout  = { git = "https://github.com/typst/typst", rev = "5187e083" }
+typst-pdf     = { git = "https://github.com/typst/typst", rev = "5187e083" }
 typst-assets  = { git = "https://github.com/typst/typst-assets", rev = "57a38ca", features = ["fonts"] }
-comrak = { version = "0.52", default-features = false }
-ecow = "0.2"
-hayagriva = "0.9.1"
-smallvec = { version = "1.11", features = ["union", "const_generics", "const_new"] }
-typed-arena = "2.0"
-fontdb = "0.23"
 
 [features]
 default = ["nif_version_2_15"]
