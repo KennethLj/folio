@@ -225,6 +225,31 @@ defmodule FolioTest do
 
       refute log =~ "Folio:"
     end
+
+    test "raw_typst reports a syntax error instead of rendering a placeholder" do
+      assert {:error, %Folio.CompileError{reason: reason}} =
+               Folio.to_svg([Folio.DSL.raw_typst("#invalid(")])
+
+      assert reason =~ "unclosed delimiter"
+    end
+
+    test "raw_typst reports an evaluation error" do
+      assert {:error, %Folio.CompileError{reason: reason}} =
+               Folio.to_svg([Folio.DSL.raw_typst("#undefined_fn()")])
+
+      assert reason =~ "unknown variable"
+      assert reason =~ "undefined_fn"
+    end
+
+    test "a raw_typst failure nested among other content still fails the compile" do
+      assert {:error, %Folio.CompileError{}} =
+               Folio.to_svg([Folio.DSL.heading(1, "Title"), Folio.DSL.raw_typst("#bad(")])
+    end
+
+    test "valid raw_typst still compiles" do
+      assert {:ok, [page]} = Folio.to_svg([Folio.DSL.raw_typst("#let f(x) = [<#x>]\n#f[hi]")])
+      assert page =~ "<svg"
+    end
   end
 
   describe "to_png/2" do

@@ -1,7 +1,8 @@
 use std::num::NonZeroUsize;
 use std::str::FromStr;
 
-use ecow::{eco_format, EcoString};
+use ecow::{eco_format, eco_vec, EcoString};
+use typst::diag::error;
 use typst::engine::Engine;
 use typst::foundations::{Bytes, Content, NativeElement, OneOrMultiple, Smart, Unlabellable};
 use std::sync::Arc;
@@ -507,12 +508,26 @@ fn convert_node(engine: &mut Engine, node: &ExContent) -> Content {
                 typst::syntax::SyntaxMode::Markup,
                 typst::foundations::Scope::new(),
             );
+            // `convert_node` can't return a Result, so failures go through the
+            // sink as delayed errors — `FolioWorld::layout` promotes those into
+            // a real compile error once layout finishes. Rendering a placeholder
+            // here instead would bake "[raw typst: eval error]" into the output
+            // and still report success.
             match result {
                 Ok(value) => match value.cast::<Content>() {
                     Ok(content) => content,
-                    Err(_) => TextElem::packed("[raw typst: not content]"),
+                    Err(err) => {
+                        engine.sink.delay(eco_vec![error!(
+                            Span::detached(),
+                            "raw_typst did not evaluate to content: {}", err.message()
+                        )]);
+                        Content::empty()
+                    }
                 },
-                Err(_) => TextElem::packed("[raw typst: eval error]"),
+                Err(errs) => {
+                    engine.sink.delay(errs);
+                    Content::empty()
+                }
             }
         }
 

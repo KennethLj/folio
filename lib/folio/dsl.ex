@@ -1109,6 +1109,19 @@ defmodule Folio.DSL do
   Raw Typst source injected directly.
 
       raw_typst("#set text(hyphenate: false)\\nHello")
+
+  This runs Typst's evaluator, so the whole language is available — set and
+  show rules, `context`, `for`, `let` and user-defined functions.
+
+  Source that fails to parse or evaluate fails the compile with
+  `Folio.CompileError`; it is not rendered as a placeholder.
+
+  > #### Not for untrusted input {: .warning}
+  >
+  > This evaluates arbitrary Typst. Typst caps a single loop at 10,000
+  > iterations, but nested loops multiply and compilation runs on a dirty
+  > scheduler. File access is limited to registered and session-attached
+  > files. Build documents from the typed DSL when the input isn't yours.
   """
   @spec raw_typst(String.t()) :: Content.RawTypst.t()
   def raw_typst(source) when is_binary(source) do
